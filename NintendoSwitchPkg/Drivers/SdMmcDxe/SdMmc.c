@@ -713,6 +713,12 @@ SdQuiesceOnExitBootServices (
 {
 	struct tegra_mmc_priv *priv = &mPriv;
 
+	// Log what the OS will see in the capabilities registers
+	DEBUG((EFI_D_INFO, "SD: caps=%08x %08x ver=%04x\n",
+		readl(&priv->reg->capareg),
+		readl(&priv->reg->res2),
+		readw(&priv->reg->hcver)));
+
 	writel(0, &priv->reg->norintsigen);
 	writel(0, &priv->reg->norintstsen);
 	writel(0xffffffff, &priv->reg->norintsts);
