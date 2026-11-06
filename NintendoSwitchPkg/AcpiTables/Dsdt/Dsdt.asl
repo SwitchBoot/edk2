@@ -139,6 +139,15 @@ DefinitionBlock("DsdtTable.aml", "DSDT", 1, "NVIDIA", "TEGRA210", EFI_ACPI_ARM_O
                 Return (RSRC)
             }
 
+            // T210 SDMMC DMA is 32-bit only
+            Name (_DSD, Package () {
+                ToUUID ("daffd814-6eba-4d8c-8a91-bc9bbf4aa301"),
+                Package () {
+                    Package () {"dma-coherent", 0},
+                    Package () {"max-block-count", 64}
+                }
+            })
+
             Method (_STA, 0, NotSerialized)
             {
                 Return (0x0F)
