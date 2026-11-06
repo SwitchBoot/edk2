@@ -121,6 +121,24 @@ DefinitionBlock("DsdtTable.aml", "DSDT", 1, "NVIDIA", "TEGRA210", EFI_ACPI_ARM_O
             Name (_UID, 0x1)
             Name (_CCA, 0x0)            // DMA is not coherent
 
+            Method (_CRS, 0, NotSerialized)
+            {
+                Name (RSRC, ResourceTemplate ()
+                {
+                    Memory32Fixed (ReadWrite,
+                        0x700B0000,     // Register base
+                        0x200,          // Length
+                        )
+                    Interrupt (ResourceConsumer, Level, ActiveHigh, Exclusive, ,, )
+                    {
+                        0x2E,           // SPI 14 + 32
+                    }
+                    FixedDMA (0x0000, 0x0000, Width32bit, )
+                    FixedDMA (0x0001, 0x0001, Width32bit, )
+                })
+                Return (RSRC)
+            }
+
             Method (_STA, 0, NotSerialized)
             {
                 Return (0x0F)
