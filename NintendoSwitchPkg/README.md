@@ -53,9 +53,8 @@ Plug in connector on the right-side Joy Con and connect to PC. Use WinDbg serial
 ## Clone Repositories
 - git clone https://github.com/fail0verflow/shofel2.git
 - git clone https://github.com/WolfLink115/Coreboot.git --recursive
-- git clone https://github.com/tianocore/edk2.git --recursive
-    ### Clone NintendoSwitchPkg inside of the EDK2 source
-    - https://github.com/WolfLink115/NintendoSwitchPkg.git
+- git clone https://github.com/SwitchBoot/edk2.git -b nintendoswitch --recursive
+    ### NintendoSwitchPkg is already included in this EDK2 branch
 
 ## Build ShofEL2 exploit, EDK2, and Coreboot
 - cd shofel2/exploit && make
