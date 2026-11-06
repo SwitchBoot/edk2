@@ -130,7 +130,7 @@ DefinitionBlock("DsdtTable.aml", "DSDT", 1, "NVIDIA", "TEGRA210", EFI_ACPI_ARM_O
                         0x700B0000,     // Register base
                         0x200,          // Length
                         )
-                    Interrupt (ResourceConsumer, Level, ActiveHigh, Exclusive, ,, )
+                    Interrupt (ResourceConsumer, Level, ActiveHigh, ExclusiveAndWake, ,, )
                     {
                         0x2E,           // SPI 14 + 32
                     }
