@@ -44,6 +44,25 @@ TEGRA_MMC_PRIV mPriv;
 struct mmc mMmcInstance;
 struct blk_desc mBlkDesc;
 
+// Set once the card is initialised. Timeouts are normal while probing.
+static BOOLEAN mSdReady = FALSE;
+
+// Reset the CMD and DAT lines after a failed transfer. Without this a
+// single error leaves the controller stuck and every later read fails.
+static void tegra_mmc_recover_lines(void)
+{
+	struct tegra_mmc_priv *priv = &mPriv;
+	unsigned int timeout = 100;
+
+	writeb(TEGRA_MMC_SWRST_SW_RESET_FOR_CMD_LINE | TEGRA_MMC_SWRST_SW_RESET_FOR_DAT_LINE, &priv->reg->swrst);
+	while (readb(&priv->reg->swrst) & (TEGRA_MMC_SWRST_SW_RESET_FOR_CMD_LINE | TEGRA_MMC_SWRST_SW_RESET_FOR_DAT_LINE)) {
+		if (timeout-- == 0) break;
+		udelay(100);
+	}
+	writel(0xffffffff, &priv->reg->norintsts);
+	writew(0xffff, &priv->reg->acmd12errsts);
+}
+
 void tegra_mmc_set_power(
     struct tegra_mmc_priv *priv,
     unsigned short power)
@@ -251,6 +270,7 @@ int tegra_mmc_send_cmd_bounced(
 	{
 		printf("%s: waiting for status update\n", __func__);
 		writel(mask, &priv->reg->norintsts);
+		if (mSdReady) tegra_mmc_recover_lines();
 		return -ETIMEDOUT;
 	}
 
@@ -259,6 +279,7 @@ int tegra_mmc_send_cmd_bounced(
 		/* Timeout Error */
 		debug("timeout: %08x cmd %d \n", mask, cmd->cmdidx);
 		writel(mask, &priv->reg->norintsts);
+		if (mSdReady) tegra_mmc_recover_lines();
 		return -ETIMEDOUT;
 	} 
 	else if (mask & TEGRA_MMC_NORINTSTS_ERR_INTERRUPT) 
@@ -266,6 +287,7 @@ int tegra_mmc_send_cmd_bounced(
 		/* Error Interrupt */
 		debug("error: %08x cmd %d \n", mask, cmd->cmdidx);
 		writel(mask, &priv->reg->norintsts);
+		if (mSdReady) tegra_mmc_recover_lines();
 		return -1;
 	}
 
@@ -328,6 +350,7 @@ int tegra_mmc_send_cmd_bounced(
 				writel(mask, &priv->reg->norintsts);
 				printf("%s: error during transfer: 0x%08x\n",
 						__func__, mask);
+				tegra_mmc_recover_lines();
 				return -1;
 			} 
 			else if (mask & TEGRA_MMC_NORINTSTS_DMA_INTERRUPT) 
@@ -361,6 +384,7 @@ int tegra_mmc_send_cmd_bounced(
 				       readl(&priv->reg->norintstsen),
 				       readl(&priv->reg->norintsigen),
 				       readl(&priv->reg->prnsts));
+				tegra_mmc_recover_lines();
 				return -1;
 			}
 		}
@@ -721,6 +745,7 @@ SdMmcDxeInitialize
 		Status = EFI_DEVICE_ERROR;
 		goto exit;
 	}
+	mSdReady = TRUE;
 
 	if (mMmcInstance.has_init == 1)
 	{
