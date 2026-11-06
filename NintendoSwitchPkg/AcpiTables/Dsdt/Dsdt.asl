@@ -114,5 +114,18 @@ DefinitionBlock("DsdtTable.aml", "DSDT", 1, "NVIDIA", "TEGRA210", EFI_ACPI_ARM_O
             }
         }
 
+        // SDMMC1: microSD slot
+        Device (SDM1)
+        {
+            Name (_HID, "PNP0D40")      // SD Host Controller
+            Name (_UID, 0x1)
+            Name (_CCA, 0x0)            // DMA is not coherent
+
+            Method (_STA, 0, NotSerialized)
+            {
+                Return (0x0F)
+            }
+        }
+
     } // Scope(_SB)
 }
