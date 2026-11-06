@@ -134,8 +134,6 @@ DefinitionBlock("DsdtTable.aml", "DSDT", 1, "NVIDIA", "TEGRA210", EFI_ACPI_ARM_O
                     {
                         0x2E,           // SPI 14 + 32
                     }
-                    FixedDMA (0x0000, 0x0000, Width32bit, )
-                    FixedDMA (0x0001, 0x0001, Width32bit, )
                 })
                 Return (RSRC)
             }
