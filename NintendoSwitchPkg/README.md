@@ -22,6 +22,15 @@ ACPI also boots Windows and Linux, but limited devices are provided (only CPU at
     
 Plug in connector on the right-side Joy Con and connect to PC. Use WinDbg serial connection and it should work.
 
+## Windows Boot Notes
+- Use Windows 10 ARM64 or Windows 11 up to 23H2. Newer Windows 11 builds need ARMv8.1 atomics and the Cortex-A57 only has ARMv8.0.
+- The Tegra SDMMC DMA can't reach memory above 4 GB, so keep Windows below that line. Without this you can get INACCESSIBLE_BOOT_DEVICE (0x7B):
+
+        bcdedit /store E:\EFI\Microsoft\Boot\BCD /set {default} truncatememory 0x100000000
+
+- Only the microSD slot (SDM1) is exposed in ACPI. The eMMC holds the console keys and calibration data, so keep it hidden from Windows.
+- If it still stops with 0x7B, check the first bugcheck parameter with the debugger below.
+
 ## Planned / In-Progress
 
 - EHCI USB host
