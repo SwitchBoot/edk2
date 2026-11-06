@@ -10,6 +10,7 @@
 #include <Library/BaseLib.h>
 #include <Library/CacheMaintenanceLib.h>
 #include <Library/DevicePathLib.h>
+#include <Guid/EventGroup.h>
 #include <Library/IoLib.h>
 #include <Protocol/BlockIo.h>
 #include <Protocol/BlockIo2.h>
@@ -699,6 +700,24 @@ SdControllerProbe
     return EFI_SUCCESS;
 }
 
+// Leave the controller quiet when the OS takes over: no pending status and
+// no interrupt routed to the GIC. The OS driver installs its own handler
+// and initialises the card again.
+static
+VOID
+EFIAPI
+SdQuiesceOnExitBootServices (
+    IN EFI_EVENT Event,
+    IN VOID      *Context
+)
+{
+	struct tegra_mmc_priv *priv = &mPriv;
+
+	writel(0, &priv->reg->norintsigen);
+	writel(0, &priv->reg->norintstsen);
+	writel(0xffffffff, &priv->reg->norintsts);
+}
+
 EFI_STATUS
 EFIAPI
 SdMmcDxeInitialize
@@ -709,6 +728,7 @@ SdMmcDxeInitialize
 {
     EFI_STATUS Status;
 	BIO_INSTANCE *Instance;
+	EFI_EVENT ExitEvent;
 
     Status = gBS->LocateProtocol(
         &gTegraUBootClockManagementProtocolGuid,
@@ -746,6 +766,15 @@ SdMmcDxeInitialize
 		goto exit;
 	}
 	mSdReady = TRUE;
+
+	gBS->CreateEventEx(
+		EVT_NOTIFY_SIGNAL,
+		TPL_CALLBACK,
+		SdQuiesceOnExitBootServices,
+		NULL,
+		&gEfiEventExitBootServicesGuid,
+		&ExitEvent
+	);
 
 	if (mMmcInstance.has_init == 1)
 	{

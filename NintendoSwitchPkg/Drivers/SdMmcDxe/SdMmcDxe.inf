@@ -42,6 +42,9 @@
 [BuildOptions.AARCH64]
   GCC:*_*_*_CC_FLAGS = -Wno-unused-function -Wno-unused-variable
 
+[Guids]
+  gEfiEventExitBootServicesGuid
+
 [Protocols]
   gTegra210ClockManagementProtocolGuid
   gTegraUBootClockManagementProtocolGuid
