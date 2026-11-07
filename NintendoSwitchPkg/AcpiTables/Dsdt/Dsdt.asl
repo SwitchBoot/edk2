@@ -144,5 +144,104 @@ DefinitionBlock("DsdtTable.aml", "DSDT", 1, "NVIDIA", "TEGRA210", EFI_ACPI_ARM_O
             }
         }
 
+#ifdef SWITCH_ACPI_EHCI_ENABLE
+        // USB1: ChipIdea EHCI, SPI 20. Windows binds its inbox EHCI driver
+        // through the PNP0D20 compatible ID.
+        Device (EHC0)
+        {
+            Name (_HID, "NVDA0211")
+            Name (_CID, "PNP0D20")      // EHCI USB controller
+            Name (_UID, Zero)
+            Name (_HRV, 2)              // Integrated TT, speed in HOSTPC1
+
+            Method (_CRS, 0, NotSerialized)
+            {
+                Name (RSRC, ResourceTemplate ()
+                {
+                    Memory32Fixed (ReadWrite,
+                        0x7D000100,     // Capability registers
+                        0x740,          // Length
+                        )
+                    Interrupt (ResourceConsumer, Level, ActiveHigh, Exclusive, ,, )
+                    {
+                        0x34,           // SPI 20 + 32
+                    }
+                })
+                Return (RSRC)
+            }
+
+            // USBMODE, CM selects host or device mode
+            OperationRegion (UMOD, SystemMemory, 0x7D0001F8, 0x04)
+            Field (UMOD, DWordAcc, NoLock, Preserve)
+            {
+                USMD,   32
+            }
+
+            // USB_SUSP_CTRL, bit 7 is USB_PHY_CLK_VALID
+            OperationRegion (USPC, SystemMemory, 0x7D000400, 0x04)
+            Field (USPC, DWordAcc, NoLock, Preserve)
+            {
+                SCTL,   32
+            }
+
+            // Windows USB _DSM. Function 1 runs after every controller reset.
+            // A reset drops the controller out of host mode, so switch it back
+            // once the PHY clock is valid again. Function 6 asks for 32-bit
+            // register access.
+            Method (_DSM, 4, Serialized)
+            {
+                If ((Arg0 == ToUUID ("ce2ee385-00e6-48cb-9f05-2edb927c4899")))
+                {
+                    If ((Arg2 == Zero))
+                    {
+                        Return (Buffer (One) { 0x43 })   // functions 0, 1 and 6
+                    }
+
+                    If ((Arg2 == One))
+                    {
+                        Local0 = 1000
+                        While (Local0)
+                        {
+                            If ((SCTL & 0x80))
+                            {
+                                Break
+                            }
+
+                            Stall (100)
+                            Local0--
+                        }
+
+                        USMD = ((USMD & 0xFFFFFFFC) | 0x03)
+                        Local0 = 1000
+                        While (Local0)
+                        {
+                            If (((USMD & 0x03) == 0x03))
+                            {
+                                Break
+                            }
+
+                            Stall (100)
+                            Local0--
+                        }
+
+                        Return (Zero)
+                    }
+
+                    If ((Arg2 == 6))
+                    {
+                        Return (One)
+                    }
+                }
+
+                Return (Buffer (One) { 0x00 })
+            }
+
+            Method (_STA, 0, NotSerialized)
+            {
+                Return (0x0F)
+            }
+        }
+#endif
+
     } // Scope(_SB)
 }
