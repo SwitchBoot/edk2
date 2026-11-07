@@ -89,10 +89,12 @@ if ($commit) {
 	Set-Content -Path NintendoSwitchPkg/Include/FwReleaseInfo.h -Value $releaseInfoContent -ErrorAction SilentlyContinue -Force
 }
 
-# SWITCH_USB=1 in the environment builds the USB host stack too.
+# Optional switches from the environment, for example SWITCH_USB=1
 $buildArgs = @()
-if ($env:SWITCH_USB -eq "1") {
-	$buildArgs += @("-D", "SWITCH_USB=1")
+foreach ($switch in @("SWITCH_USB", "SWITCH_ACPI_EHCI")) {
+	if ([Environment]::GetEnvironmentVariable($switch) -eq "1") {
+		$buildArgs += @("-D", "$switch=1")
+	}
 }
 
 foreach ($target in $availableTargets) {
