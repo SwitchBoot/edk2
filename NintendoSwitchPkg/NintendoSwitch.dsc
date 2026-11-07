@@ -30,11 +30,23 @@
   SKUID_IDENTIFIER               = DEFAULT
   FLASH_DEFINITION               = NintendoSwitchPkg/NintendoSwitch.fdf
 
+  # Show the USB1 EHCI to Windows through ACPI. The firmware has to bring the
+  # controller up first, otherwise Windows stalls on the dead PHY.
+!ifdef SWITCH_ACPI_EHCI
+!ifndef SWITCH_USB
+!error "SWITCH_ACPI_EHCI needs SWITCH_USB=1"
+!endif
+  DEFINE ACPI_ASL_EHCI           = -DSWITCH_ACPI_EHCI_ENABLE
+!else
+  DEFINE ACPI_ASL_EHCI           =
+!endif
+
 [BuildOptions.common.EDKII.DXE_RUNTIME_DRIVER]
   GCC:*_*_AARCH64_DLINK_FLAGS = -z common-page-size=0x10000
 
 [BuildOptions.common]
   GCC:*_*_AARCH64_CC_FLAGS = -Wno-unused-variable
+  GCC:*_*_AARCH64_ASLPP_FLAGS = $(ACPI_ASL_EHCI)
 
 ################################################################################
 #
