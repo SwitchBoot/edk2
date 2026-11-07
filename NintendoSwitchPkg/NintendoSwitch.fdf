@@ -114,11 +114,20 @@ READ_LOCK_STATUS   = TRUE
   INF NintendoSwitchPkg/Drivers/PmicDxe/PmicDxe.inf
   INF NintendoSwitchPkg/Drivers/SdMmcDxe/SdMmcDxe.inf
   INF NintendoSwitchPkg/Drivers/PinMuxDxe/PinMuxDxe.inf
-  # INF NintendoSwitchPkg/Drivers/EhciPciEmulationDxe/PciEmulation.inf
+!ifdef SWITCH_USB
+  INF NintendoSwitchPkg/Drivers/EhciPciEmulationDxe/PciEmulation.inf
+!endif
   INF MdeModulePkg/Bus/Pci/NonDiscoverablePciDeviceDxe/NonDiscoverablePciDeviceDxe.inf
+!ifdef SWITCH_USB
+  INF NintendoSwitchPkg/Drivers/EhciDxeTegra/EhciDxeTegra.inf
+!else
   INF MdeModulePkg/Bus/Pci/EhciDxe/EhciDxe.inf
+!endif
   INF MdeModulePkg/Bus/Usb/UsbBusDxe/UsbBusDxe.inf
   INF MdeModulePkg/Bus/Usb/UsbMassStorageDxe/UsbMassStorageDxe.inf
+!ifdef SWITCH_USB
+  INF MdeModulePkg/Bus/Usb/UsbKbDxe/UsbKbDxe.inf
+!endif
 
   # Disk IO
   INF MdeModulePkg/Universal/Disk/DiskIoDxe/DiskIoDxe.inf

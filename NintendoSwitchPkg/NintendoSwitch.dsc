@@ -389,7 +389,37 @@
   NintendoSwitchPkg/Drivers/PmicDxe/PmicDxe.inf
   NintendoSwitchPkg/Drivers/SdMmcDxe/SdMmcDxe.inf
   NintendoSwitchPkg/Drivers/PinMuxDxe/PinMuxDxe.inf
-  # NintendoSwitchPkg/Drivers/EhciPciEmulationDxe/PciEmulation.inf
+!ifdef SWITCH_USB
+  # USB host, opt-in with -D SWITCH_USB=1
+  # BaseMemoryLibOptDxe uses DC ZVA, which faults on the non-cacheable USB DMA buffers
+  NintendoSwitchPkg/Drivers/EhciPciEmulationDxe/PciEmulation.inf
+  MdeModulePkg/Bus/Pci/NonDiscoverablePciDeviceDxe/NonDiscoverablePciDeviceDxe.inf {
+    <LibraryClasses>
+      BaseMemoryLib|MdePkg/Library/BaseMemoryLib/BaseMemoryLib.inf
+    <BuildOptions>
+      GCC:*_*_AARCH64_CC_FLAGS = -mstrict-align
+  }
+  NintendoSwitchPkg/Drivers/EhciDxeTegra/EhciDxeTegra.inf {
+    <LibraryClasses>
+      BaseMemoryLib|MdePkg/Library/BaseMemoryLib/BaseMemoryLib.inf
+    <PcdsFixedAtBuild>
+      gEfiMdePkgTokenSpaceGuid.PcdDebugPrintErrorLevel|0x800fffff
+    <BuildOptions>
+      GCC:*_*_AARCH64_CC_FLAGS = -mstrict-align
+  }
+  MdeModulePkg/Bus/Usb/UsbBusDxe/UsbBusDxe.inf {
+    <LibraryClasses>
+      BaseMemoryLib|MdePkg/Library/BaseMemoryLib/BaseMemoryLib.inf
+  }
+  MdeModulePkg/Bus/Usb/UsbMassStorageDxe/UsbMassStorageDxe.inf {
+    <LibraryClasses>
+      BaseMemoryLib|MdePkg/Library/BaseMemoryLib/BaseMemoryLib.inf
+  }
+  MdeModulePkg/Bus/Usb/UsbKbDxe/UsbKbDxe.inf {
+    <LibraryClasses>
+      BaseMemoryLib|MdePkg/Library/BaseMemoryLib/BaseMemoryLib.inf
+  }
+!else
   MdeModulePkg/Bus/Pci/NonDiscoverablePciDeviceDxe/NonDiscoverablePciDeviceDxe.inf
   MdeModulePkg/Bus/Pci/EhciDxe/EhciDxe.inf {
     <PcdsFixedAtBuild>
@@ -397,6 +427,7 @@
   }
   MdeModulePkg/Bus/Usb/UsbBusDxe/UsbBusDxe.inf
   MdeModulePkg/Bus/Usb/UsbMassStorageDxe/UsbMassStorageDxe.inf
+!endif
 
   # Serial
   MdeModulePkg/Universal/SerialDxe/SerialDxe.inf
