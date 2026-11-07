@@ -3,6 +3,10 @@
   Copyright (c) 2008 - 2009, Apple Inc. All rights reserved.<BR>
   Copyright (c) 2016, Linaro, Ltd. All rights reserved.<BR>
   Copyright (c) 2019, Bingxing Wang. All rights reserved.<BR>
+  Portions ported from hekate (https://github.com/CTCaer/hekate), Copyright (c) 2018-2024 CTCaer,
+  GPL-2.0-only: PLLU/UTMIPLL/UTMIP PHY bring-up, bm92t36 I2C packet transfer, VBUS handling.
+  Those portions make this file GPL-2.0-only as a whole (see ../../LICENSE).
+  Based on the PciEmulation from steck0714/winx.<BR>
 
   This program and the accompanying materials
   are licensed and made available under the terms and conditions of the BSD License
@@ -20,6 +24,8 @@
 #include <Library/DebugLib.h>
 #include <Library/IoLib.h>
 #include <Library/NonDiscoverableDeviceRegistrationLib.h>
+#include <Library/PrintLib.h>
+#include <Library/UefiLib.h>
 #include <Library/UefiBootServicesTableLib.h>
 
 #include <Protocol/UBootClockManagement.h>
@@ -34,6 +40,8 @@
 #include <Device/T210.h>
 #include <Device/Pmc.h>
 #include <Library/GpioLib.h>
+#include <Library/I2cLib.h>
+#include <Guid/EventGroup.h>
 #include <Protocol/Pmic.h>
 #include <Shim/DebugLib.h>
 #include <Shim/UBootIo.h>
@@ -46,311 +54,751 @@
 TEGRA210_UBOOT_CLOCK_MANAGEMENT_PROTOCOL* mClkProtocol;
 FDT_USB mPriv;
 
-static void usbf_reset_controller(
-    struct fdt_usb *config,
-    struct usb_ctlr *usbctlr
-)
-{
-	/* Reset the USB controller with 2us delay */
-	mClkProtocol->ResetPeriph(config->periph_id, 2);
+/*
+ * Tegra210 USB1 (USBD / UTMIP) bring-up.
+ *
+ * The register sequence below is ported from hekate (CTCaer, GPLv2):
+ * bdk/usb/usbd.c _usb_init_phy() and bdk/soc/clock.c clock_enable_pllu() /
+ * clock_enable_utmipll(). It is Erista-only (38.4 MHz oscillator).
+ *
+ * Why this replaces the former U-Boot derived sequence: that code touched the
+ * USB controller registers *before* PLLU was running and never started UTMIPLL.
+ * When booted through RCM + coreboot the bootrom had already left both PLLs
+ * running, so it got away with it. hekate stops PLLU/UTMIPLL before it hands
+ * over to BL33, and touching the USB1 block without PLLU stalls the CPU.
+ * Every wait below is bounded.
+ */
+#define CLK_RST_BASE                    0x60006000UL
+#define CLK_RST(o)                      (CLK_RST_BASE + (o))
+#define CLK_RST_PLLU_BASE               0x0C0
+#define CLK_RST_PLLU_MISC               0x0CC
+#define CLK_RST_CLK_ENB_Y_SET           0x29C
+#define CLK_RST_CLK_ENB_Y_CLR           0x2A0
+#define CLK_RST_RST_DEV_L_SET           0x300
+#define CLK_RST_RST_DEV_L_CLR           0x304
+#define CLK_RST_CLK_ENB_L_SET           0x320
+#define CLK_RST_CLK_ENB_H_SET           0x328
+#define CLK_RST_RST_DEV_W_CLR           0x43C
+#define CLK_RST_UTMIP_PLL_CFG0          0x480
+#define CLK_RST_UTMIP_PLL_CFG1          0x484
+#define CLK_RST_UTMIP_PLL_CFG2          0x488
+#define CLK_RST_UTMIPLL_HW_PWRDN_CFG0   0x52C
+#define CLK_RST_CLK_SOURCE_USB2_HSIC_TRK 0x6CC
 
-	/*
-	 * Set USB1_NO_LEGACY_MODE to 1, Registers are accessible under
-	 * base address
-	 */
-	if (config->has_legacy_mode)
-	{
-        setbits_le32(&usbctlr->usb1_legacy_ctrl, USB1_NO_LEGACY_MODE);
-    }
+#define PLL_BASE_LOCK                   BIT27
+#define PLL_BASE_ENABLE                 BIT30
+#define UTMIPLL_LOCK                    BIT31
 
-	/* Put UTMIP1/3 in reset */
-	setbits_le32(&usbctlr->susp_ctrl, UTMIP_RESET);
+#define CLK_H_FUSE                      7
+#define CLK_L_USBD                      22
+#define CLK_W_XUSB_PADCTL               14
+#define CLK_Y_USB2_TRK                  18
 
-	/* Enable the UTMIP PHY */
-	if (config->utmi)
-	{
-        setbits_le32(&usbctlr->susp_ctrl, UTMIP_PHY_ENB);
-    }
-}
+#define USB1_BASE_ADDR                  0x7D000000UL
+#define USB1_REG(o)                     (USB1_BASE_ADDR + (o))
+#define USB1_USBCMD                     0x130
+#define USB1_HOSTPC1_DEVLC              0x1B4
+#define USB1_USBMODE                    0x1F8
+#define USB1_PORTSC                     0x174   // op base 0x130 + PORTSC 0x44
+#define USB1_SUSP_CTRL                  0x400
+#define USB1_PHY_VBUS_SENSORS           0x404
+#define USB1_UTMIP_XCVR_CFG0            0x808
+#define USB1_UTMIP_BIAS_CFG0            0x80C
+#define USB1_UTMIP_HSRX_CFG0            0x810
+#define USB1_UTMIP_HSRX_CFG1            0x814
+#define USB1_UTMIP_TX_CFG0              0x820
+#define USB1_UTMIP_MISC_CFG1            0x828
+#define USB1_UTMIP_DEBOUNCE_CFG0        0x82C
+#define USB1_UTMIP_SPARE_CFG0           0x834
+#define USB1_UTMIP_XCVR_CFG1            0x838
+#define USB1_UTMIP_BIAS_CFG1            0x83C
+#define USB1_UTMIP_BIAS_CFG2            0x850
+#define USB1_UTMIP_XCVR_CFG2            0x854
+#define USB1_UTMIP_XCVR_CFG3            0x858
 
-static const unsigned *get_pll_timing(struct fdt_usb_controller *controller)
-{
-	const unsigned *timing;
-	timing = controller->pll_parameter + mClkProtocol->GetOscFreq() * PARAM_COUNT;
+#define SUSP_CTRL_USB_PHY_CLK_VALID     BIT7
+#define SUSP_CTRL_UTMIP_RESET           BIT11
+#define SUSP_CTRL_UTMIP_PHY_ENB         BIT12
 
-	return timing;
-}
+#define USBCMD_RUN                      BIT0
+#define PORTSC_PP                       BIT12   // port power
+#define PORTSC_W1C_MASK                 (BIT1 | BIT3 | BIT5)   // CSC / PEC / OCC: write 1 clears, never write them back
 
-/* select the PHY to use with a USB controller */
-static void init_phy_mux(struct fdt_usb *config, uint pts,
-			 enum usb_init_type init)
-{
-	struct usb_ctlr *usbctlr = config->reg;
-
-#if defined(CONFIG_TEGRA20)
-	if (config->periph_id == PERIPH_ID_USBD) {
-		clrsetbits_le32(&usbctlr->port_sc1, PTS1_MASK,
-				pts << PTS1_SHIFT);
-		clrbits_le32(&usbctlr->port_sc1, STS1);
-	} else {
-		clrsetbits_le32(&usbctlr->port_sc1, PTS_MASK,
-				pts << PTS_SHIFT);
-		clrbits_le32(&usbctlr->port_sc1, STS);
-	}
-#else
-	/* Set to Host mode (if applicable) after Controller Reset was done */
-	clrsetbits_le32(&usbctlr->usb_mode, USBMODE_CM_HC,
-			(init == USB_INIT_HOST) ? USBMODE_CM_HC : 0);
-	/*
-	 * Select PHY interface after setting host mode.
-	 * For device mode, the ordering requirement is not an issue, since
-	 * only the first USB controller supports device mode, and that USB
-	 * controller can only talk to a UTMI PHY, so the PHY selection is
-	 * already made at reset time, so this write is a no-op.
-	 */
-	clrsetbits_le32(&usbctlr->hostpc1_devlc, PTS_MASK,
-			pts << PTS_SHIFT);
-	clrbits_le32(&usbctlr->hostpc1_devlc, STS);
+#ifndef SWITCH_USB_POWERWATCH
+#define SWITCH_USB_POWERWATCH           1       // 0 = compile the charger/VBUS watcher out
 #endif
+#define USBCMD_RESET                    BIT1
+#define USBMODE_CM_MASK                 0x3
+#define USBMODE_CM_HOST                 0x3
+
+#define FUSE_BASE_ADDR                  0x7000F800UL
+#define FUSE_USB_CALIB                  0x1F0
+#define FUSE_USB_CALIB_EXT              0x350
+#define PMC_BASE_ADDR                   0x7000E400UL
+#define PMC_USB_AO                      0xF0
+
+#define USB_POLL_RETRIES                100000
+
+STATIC
+UINT32
+ClkRd (UINTN Off)
+{
+  return MmioRead32 (CLK_RST (Off));
 }
 
-/* set up the UTMI USB controller with the parameters provided */
-static int init_utmi_usb_controller(
-    struct fdt_usb *config,
-    enum usb_init_type init
-)
+STATIC
+VOID
+ClkWr (UINTN Off, UINT32 Val)
 {
-	struct fdt_usb_controller *controller;
-	u32 b_sess_valid_mask, val;
-	int loop_count;
-	const unsigned *timing;
-	struct usb_ctlr *usbctlr = config->reg;
-	struct clk_rst_ctlr *clkrst;
-	struct usb_ctlr *usb1ctlr;
+  MmioWrite32 (CLK_RST (Off), Val);
+}
 
-    mClkProtocol->EnableClk(config->periph_id);
+STATIC
+UINT32
+UsbRd (UINTN Off)
+{
+  return MmioRead32 (USB1_REG (Off));
+}
 
-	/* Reset the usb controller */
-	usbf_reset_controller(config, usbctlr);
+STATIC
+VOID
+UsbWr (UINTN Off, UINT32 Val)
+{
+  MmioWrite32 (USB1_REG (Off), Val);
+}
 
-	/* Stop crystal clock by setting UTMIP_PHY_XTAL_CLOCKEN low */
-	clrbits_le32(&usbctlr->utmip_misc_cfg1, UTMIP_PHY_XTAL_CLOCKEN);
+STATIC
+VOID
+UsbAnd (UINTN Off, UINT32 Mask)
+{
+  UsbWr (Off, UsbRd (Off) & Mask);
+}
 
-	/* Follow the crystal clock disable by >100ns delay */
-	udelay(1);
+STATIC
+VOID
+UsbOr (UINTN Off, UINT32 Bits)
+{
+  UsbWr (Off, UsbRd (Off) | Bits);
+}
 
-	b_sess_valid_mask = (VBUS_B_SESS_VLD_SW_VALUE | VBUS_B_SESS_VLD_SW_EN);
-	clrsetbits_le32(&usbctlr->phy_vbus_sensors, b_sess_valid_mask,
-			(init == USB_INIT_DEVICE) ? b_sess_valid_mask : 0);
+//
+// hekate clock_enable_pllu(): 38.4 MHz / 2 * 25 = 480 MHz. Bounded lock wait.
+// Does not touch the USB block, so it is safe with PLLU stopped.
+//
+STATIC
+VOID
+UsbEnablePllu (VOID)
+{
+  UINT32 Cfg;
+  UINT32 Retries;
 
-	/*
-	 * To Use the A Session Valid for cable detection logic, VBUS_WAKEUP
-	 * mux must be switched to actually use a_sess_vld threshold.
-	 */
-	if (config->dr_mode == DR_MODE_OTG && config->vbus_gpio_valid)
-	{
-        clrsetbits_le32(
-            &usbctlr->usb1_legacy_ctrl,
-			VBUS_SENSE_CTL_MASK,
-			VBUS_SENSE_CTL_A_SESS_VLD << VBUS_SENSE_CTL_SHIFT
-        );
+  ClkWr (CLK_RST_PLLU_MISC, ClkRd (CLK_RST_PLLU_MISC) | BIT29);
+  Cfg = (ClkRd (CLK_RST_PLLU_BASE) & 0xFFE00000) | BIT24 | (1 << 16) | (0x19 << 8) | 2;
+  ClkWr (CLK_RST_PLLU_BASE, Cfg);
+  ClkWr (CLK_RST_PLLU_BASE, Cfg | PLL_BASE_ENABLE);
+
+  for (Retries = 1000; Retries != 0; Retries--) {
+    if ((ClkRd (CLK_RST_PLLU_BASE) & PLL_BASE_LOCK) != 0) {
+      break;
     }
 
-	controller = &fdt_usb_controllers[config->type];
-	debug("controller=%p, type=%d\n", controller, config->type);
+    udelay (1);
+  }
 
-	/*
-	 * PLL Delay CONFIGURATION settings. The following parameters control
-	 * the bring up of the plls.
-	 */
-	timing = get_pll_timing(controller);
+  if (Retries == 0) {
+    DEBUG ((DEBUG_ERROR, "USB: PLLU did not lock\n"));
+  }
 
-	if (!controller->has_hostpc) {
-		val = readl(&usbctlr->utmip_misc_cfg1);
-		clrsetbits_le32(&val, UTMIP_PLLU_STABLE_COUNT_MASK,
-				timing[PARAM_STABLE_COUNT] <<
-				UTMIP_PLLU_STABLE_COUNT_SHIFT);
-		clrsetbits_le32(&val, UTMIP_PLL_ACTIVE_DLY_COUNT_MASK,
-				timing[PARAM_ACTIVE_DELAY_COUNT] <<
-				UTMIP_PLL_ACTIVE_DLY_COUNT_SHIFT);
-		writel(val, &usbctlr->utmip_misc_cfg1);
+  udelay (8);
 
-		/* Set PLL enable delay count and crystal frequency count */
-		val = readl(&usbctlr->utmip_pll_cfg1);
-		clrsetbits_le32(&val, UTMIP_PLLU_ENABLE_DLY_COUNT_MASK,
-				timing[PARAM_ENABLE_DELAY_COUNT] <<
-				UTMIP_PLLU_ENABLE_DLY_COUNT_SHIFT);
-		clrsetbits_le32(&val, UTMIP_XTAL_FREQ_COUNT_MASK,
-				timing[PARAM_XTAL_FREQ_COUNT] <<
-				UTMIP_XTAL_FREQ_COUNT_SHIFT);
-		writel(val, &usbctlr->utmip_pll_cfg1);
-	} else {
-		clkrst = (struct clk_rst_ctlr *) NV_PA_CLK_RST_BASE;
-
-		val = readl(&clkrst->crc_utmip_pll_cfg2);
-		clrsetbits_le32(&val, UTMIP_PLLU_STABLE_COUNT_MASK,
-				timing[PARAM_STABLE_COUNT] <<
-				UTMIP_PLLU_STABLE_COUNT_SHIFT);
-		clrsetbits_le32(&val, UTMIP_PLL_ACTIVE_DLY_COUNT_MASK,
-				timing[PARAM_ACTIVE_DELAY_COUNT] <<
-				UTMIP_PLL_ACTIVE_DLY_COUNT_SHIFT);
-		writel(val, &clkrst->crc_utmip_pll_cfg2);
-
-		/* Set PLL enable delay count and crystal frequency count */
-		val = readl(&clkrst->crc_utmip_pll_cfg1);
-		clrsetbits_le32(&val, UTMIP_PLLU_ENABLE_DLY_COUNT_MASK,
-				timing[PARAM_ENABLE_DELAY_COUNT] <<
-				UTMIP_PLLU_ENABLE_DLY_COUNT_SHIFT);
-		clrsetbits_le32(&val, UTMIP_XTAL_FREQ_COUNT_MASK,
-				timing[PARAM_XTAL_FREQ_COUNT] <<
-				UTMIP_XTAL_FREQ_COUNT_SHIFT);
-		writel(val, &clkrst->crc_utmip_pll_cfg1);
-
-		/* Disable Power Down state for PLL */
-		clrbits_le32(&clkrst->crc_utmip_pll_cfg1,
-			     PLLU_POWERDOWN | PLL_ENABLE_POWERDOWN |
-			     PLL_ACTIVE_POWERDOWN);
-
-		/* Recommended PHY settings for EYE diagram */
-		val = readl(&usbctlr->utmip_xcvr_cfg0);
-		clrsetbits_le32(&val, UTMIP_XCVR_SETUP_MASK,
-				0x4 << UTMIP_XCVR_SETUP_SHIFT);
-		clrsetbits_le32(&val, UTMIP_XCVR_SETUP_MSB_MASK,
-				0x3 << UTMIP_XCVR_SETUP_MSB_SHIFT);
-		clrsetbits_le32(&val, UTMIP_XCVR_HSSLEW_MSB_MASK,
-				0x8 << UTMIP_XCVR_HSSLEW_MSB_SHIFT);
-		writel(val, &usbctlr->utmip_xcvr_cfg0);
-		clrsetbits_le32(&usbctlr->utmip_xcvr_cfg1,
-				UTMIP_XCVR_TERM_RANGE_ADJ_MASK,
-				0x7 << UTMIP_XCVR_TERM_RANGE_ADJ_SHIFT);
-
-		/* Some registers can be controlled from USB1 only. */
-		if (config->periph_id != PERIPH_ID_USBD) {
-			mClkProtocol->EnableClk(PERIPH_ID_USBD);
-			/* Disable Reset if in Reset state */
-			mClkProtocol->DeassertRst(PERIPH_ID_USBD);
-		}
-		usb1ctlr = (struct usb_ctlr *)
-			((unsigned long)config->reg & USB1_ADDR_MASK);
-		val = readl(&usb1ctlr->utmip_bias_cfg0);
-		setbits_le32(&val, UTMIP_HSDISCON_LEVEL_MSB);
-		clrsetbits_le32(&val, UTMIP_HSDISCON_LEVEL_MASK,
-				0x1 << UTMIP_HSDISCON_LEVEL_SHIFT);
-		clrsetbits_le32(&val, UTMIP_HSSQUELCH_LEVEL_MASK,
-				0x2 << UTMIP_HSSQUELCH_LEVEL_SHIFT);
-		writel(val, &usb1ctlr->utmip_bias_cfg0);
-
-		/* Miscellaneous setting mentioned in Programming Guide */
-		clrbits_le32(&usbctlr->utmip_misc_cfg0,
-			     UTMIP_SUSPEND_EXIT_ON_EDGE);
-	}
-
-	/* Setting the tracking length time */
-	clrsetbits_le32(&usbctlr->utmip_bias_cfg1,
-		UTMIP_BIAS_PDTRK_COUNT_MASK,
-		timing[PARAM_BIAS_TIME] << UTMIP_BIAS_PDTRK_COUNT_SHIFT);
-
-	/* Program debounce time for VBUS to become valid */
-	clrsetbits_le32(&usbctlr->utmip_debounce_cfg0,
-		UTMIP_DEBOUNCE_CFG0_MASK,
-		timing[PARAM_DEBOUNCE_A_TIME] << UTMIP_DEBOUNCE_CFG0_SHIFT);
-
-	if (timing[PARAM_DEBOUNCE_A_TIME] > 0xFFFF) {
-		clrsetbits_le32(&usbctlr->utmip_debounce_cfg0,
-				UTMIP_DEBOUNCE_CFG0_MASK,
-				(timing[PARAM_DEBOUNCE_A_TIME] >> 1)
-				<< UTMIP_DEBOUNCE_CFG0_SHIFT);
-		clrsetbits_le32(&usbctlr->utmip_bias_cfg1,
-				UTMIP_BIAS_DEBOUNCE_TIMESCALE_MASK,
-				1 << UTMIP_BIAS_DEBOUNCE_TIMESCALE_SHIFT);
-	}
-
-	setbits_le32(&usbctlr->utmip_tx_cfg0, UTMIP_FS_PREAMBLE_J);
-
-	/* Disable battery charge enabling bit */
-	setbits_le32(&usbctlr->utmip_bat_chrg_cfg0, UTMIP_PD_CHRG);
-
-	clrbits_le32(&usbctlr->utmip_xcvr_cfg0, UTMIP_XCVR_LSBIAS_SE);
-	setbits_le32(&usbctlr->utmip_spare_cfg0, FUSE_SETUP_SEL);
-
-	/*
-	 * Configure the UTMIP_IDLE_WAIT and UTMIP_ELASTIC_LIMIT
-	 * Setting these fields, together with default values of the
-	 * other fields, results in programming the registers below as
-	 * follows:
-	 *         UTMIP_HSRX_CFG0 = 0x9168c000
-	 *         UTMIP_HSRX_CFG1 = 0x13
-	 */
-
-	/* Set PLL enable delay count and Crystal frequency count */
-	val = readl(&usbctlr->utmip_hsrx_cfg0);
-	clrsetbits_le32(&val, UTMIP_IDLE_WAIT_MASK,
-		utmip_idle_wait_delay << UTMIP_IDLE_WAIT_SHIFT);
-	clrsetbits_le32(&val, UTMIP_ELASTIC_LIMIT_MASK,
-		utmip_elastic_limit << UTMIP_ELASTIC_LIMIT_SHIFT);
-	writel(val, &usbctlr->utmip_hsrx_cfg0);
-
-	/* Configure the UTMIP_HS_SYNC_START_DLY */
-	clrsetbits_le32(&usbctlr->utmip_hsrx_cfg1,
-		UTMIP_HS_SYNC_START_DLY_MASK,
-		utmip_hs_sync_start_delay << UTMIP_HS_SYNC_START_DLY_SHIFT);
-
-	/* Preceed the crystal clock disable by >100ns delay. */
-	udelay(1);
-
-	/* Resuscitate crystal clock by setting UTMIP_PHY_XTAL_CLOCKEN */
-	setbits_le32(&usbctlr->utmip_misc_cfg1, UTMIP_PHY_XTAL_CLOCKEN);
-
-	if (controller->has_hostpc) {
-		if (config->periph_id == PERIPH_ID_USBD)
-			clrbits_le32(&clkrst->crc_utmip_pll_cfg2,
-				     UTMIP_FORCE_PD_SAMP_A_POWERDOWN);
-		if (config->periph_id == PERIPH_ID_USB2)
-			clrbits_le32(&clkrst->crc_utmip_pll_cfg2,
-				     UTMIP_FORCE_PD_SAMP_B_POWERDOWN);
-		if (config->periph_id == PERIPH_ID_USB3)
-			clrbits_le32(&clkrst->crc_utmip_pll_cfg2,
-				     UTMIP_FORCE_PD_SAMP_C_POWERDOWN);
-	}
-	/* Finished the per-controller init. */
-
-	/* De-assert UTMIP_RESET to bring out of reset. */
-	clrbits_le32(&usbctlr->susp_ctrl, UTMIP_RESET);
-
-	/* Wait for the phy clock to become valid in 100 ms */
-	for (loop_count = 100000; loop_count != 0; loop_count--) {
-		if (readl(&usbctlr->susp_ctrl) & USB_PHY_CLK_VALID)
-			break;
-		udelay(1);
-	}
-	if (!loop_count) return -ETIMEDOUT;
-
-	/* Disable ICUSB FS/LS transceiver */
-	clrbits_le32(&usbctlr->icusb_ctrl, IC_ENB1);
-
-	/* Select UTMI parallel interface */
-	init_phy_mux(config, PTS_UTMI, init);
-
-	/* Deassert power down state */
-	clrbits_le32(&usbctlr->utmip_xcvr_cfg0, UTMIP_FORCE_PD_POWERDOWN |
-		UTMIP_FORCE_PD2_POWERDOWN | UTMIP_FORCE_PDZI_POWERDOWN);
-	clrbits_le32(&usbctlr->utmip_xcvr_cfg1, UTMIP_FORCE_PDDISC_POWERDOWN |
-		UTMIP_FORCE_PDCHRP_POWERDOWN | UTMIP_FORCE_PDDR_POWERDOWN);
-
-	if (controller->has_hostpc) {
-		/*
-		 * BIAS Pad Power Down is common among all 3 USB
-		 * controllers and can be controlled from USB1 only.
-		 */
-		usb1ctlr = (struct usb_ctlr *)
-			((unsigned long)config->reg & USB1_ADDR_MASK);
-		clrbits_le32(&usb1ctlr->utmip_bias_cfg0, UTMIP_BIASPD);
-		udelay(25);
-		clrbits_le32(&usb1ctlr->utmip_bias_cfg1,
-			     UTMIP_FORCE_PDTRK_POWERDOWN);
-	}
-	return 0;
+  // Enable PLLU USB/HSIC/ICUSB/48M outputs.
+  ClkWr (CLK_RST_PLLU_BASE, ClkRd (CLK_RST_PLLU_BASE) | 0x2E00000);
 }
+
+//
+// hekate clock_enable_utmipll(): 38.4 MHz * 25 / 1 = 960 MHz.
+//
+STATIC
+VOID
+UsbEnableUtmipll (VOID)
+{
+  UINT32 Retries;
+
+  ClkWr (CLK_RST_UTMIP_PLL_CFG0, (ClkRd (CLK_RST_UTMIP_PLL_CFG0) & 0xFF0000FF) | (25 << 16) | (1 << 8));
+  ClkWr (CLK_RST_UTMIP_PLL_CFG2, (ClkRd (CLK_RST_UTMIP_PLL_CFG2) & 0xFF00003F) | (24 << 18));
+  ClkWr (CLK_RST_UTMIP_PLL_CFG1, (ClkRd (CLK_RST_UTMIP_PLL_CFG1) & 0x7FFA000) | (1 << 15) | 375);
+
+  for (Retries = 100; Retries != 0; Retries--) {
+    if ((ClkRd (CLK_RST_UTMIPLL_HW_PWRDN_CFG0) & UTMIPLL_LOCK) != 0) {
+      break;
+    }
+
+    udelay (1);
+  }
+
+  if (Retries == 0) {
+    DEBUG ((DEBUG_ERROR, "USB: UTMIPLL did not lock\n"));
+  }
+}
+
+STATIC
+BOOLEAN
+UsbWaitPhyClock (VOID)
+{
+  UINT32 Retries;
+
+  for (Retries = USB_POLL_RETRIES; Retries != 0; Retries--) {
+    if ((UsbRd (USB1_SUSP_CTRL) & SUSP_CTRL_USB_PHY_CLK_VALID) != 0) {
+      return TRUE;
+    }
+
+    udelay (1);
+  }
+
+  return FALSE;
+}
+
+//
+// hekate _usb_init_phy().
+//
+STATIC
+VOID
+UsbInitPhy (VOID)
+{
+  UINT32 SuspCtrl;
+  UINT32 FuseCalib;
+
+  // PLLU first: the USB1 register block is not accessible without it.
+  UsbEnablePllu ();
+
+  // FUSE clock (needed to read the USB calibration fuses below).
+  ClkWr (CLK_RST_CLK_ENB_H_SET, 1U << CLK_H_FUSE);
+
+  // Enable USBD clock and pulse its reset.
+  ClkWr (CLK_RST_CLK_ENB_L_SET, 1U << CLK_L_USBD);
+  udelay (2);
+  ClkWr (CLK_RST_RST_DEV_L_SET, 1U << CLK_L_USBD);
+  udelay (2);
+  ClkWr (CLK_RST_RST_DEV_L_CLR, 1U << CLK_L_USBD);
+  udelay (2);
+
+  // Clear XUSB_PADCTL reset.
+  ClkWr (CLK_RST_RST_DEV_W_CLR, 1U << CLK_W_XUSB_PADCTL);
+
+  // Enable USB PHY and reset for programming.
+  SuspCtrl = UsbRd (USB1_SUSP_CTRL);
+  UsbWr (USB1_SUSP_CTRL, SuspCtrl | SUSP_CTRL_UTMIP_RESET);
+  UsbWr (USB1_SUSP_CTRL, SuspCtrl | SUSP_CTRL_UTMIP_PHY_ENB | SUSP_CTRL_UTMIP_RESET);
+
+  // Enable IDDQ control by software and disable UTMIPLL IDDQ.
+  ClkWr (CLK_RST_UTMIPLL_HW_PWRDN_CFG0, (ClkRd (CLK_RST_UTMIPLL_HW_PWRDN_CFG0) & 0xFFFFFFFC) | 1);
+  udelay (10);
+
+  // Disable crystal clock.
+  UsbAnd (USB1_UTMIP_MISC_CFG1, 0xBFFFFFFF);
+  ClkWr (CLK_RST_UTMIP_PLL_CFG2, ClkRd (CLK_RST_UTMIP_PLL_CFG2) & 0xBFFFFFFF);
+
+  // Set B_SESS_VLD.
+  UsbOr (USB1_PHY_VBUS_SENSORS, 0x1000);
+  UsbOr (USB1_PHY_VBUS_SENSORS, 0x800);
+
+  UsbEnableUtmipll ();
+
+  // Configure UTMIP transceiver cells from the fuses.
+  FuseCalib = MmioRead32 (FUSE_BASE_ADDR + FUSE_USB_CALIB);
+  UsbWr (USB1_UTMIP_XCVR_CFG0,
+         (((UsbRd (USB1_UTMIP_XCVR_CFG0) & 0xFFFFFFF0) | (FuseCalib & 0xF)) & 0xFE3FFFFF) |
+         ((((FuseCalib & 0x3F) << 25) >> 29) << 22));
+  UsbWr (USB1_UTMIP_XCVR_CFG1,
+         (UsbRd (USB1_UTMIP_XCVR_CFG1) & 0xFFC3FFFF) | ((((FuseCalib << 21) >> 28)) << 18));
+  UsbWr (USB1_UTMIP_XCVR_CFG3,
+         (UsbRd (USB1_UTMIP_XCVR_CFG3) & 0xFFFFC1FF) |
+         ((MmioRead32 (FUSE_BASE_ADDR + FUSE_USB_CALIB_EXT) & 0x1F) << 9));
+  UsbAnd (USB1_UTMIP_XCVR_CFG0, 0xFFDFFFFF);
+  UsbWr (USB1_UTMIP_XCVR_CFG2, (UsbRd (USB1_UTMIP_XCVR_CFG2) & 0xFFFFF1FF) | 0x400);
+  udelay (1);
+
+  // Misc UTMIP.
+  UsbWr (USB1_UTMIP_DEBOUNCE_CFG0, (UsbRd (USB1_UTMIP_DEBOUNCE_CFG0) & 0xFFFF0000) | 0xBB80);
+  UsbWr (USB1_UTMIP_BIAS_CFG1, (UsbRd (USB1_UTMIP_BIAS_CFG1) & 0xFFFFC0FF) | 0x100);
+
+  UsbOr (USB1_UTMIP_BIAS_CFG2, 2);
+  UsbAnd (USB1_UTMIP_SPARE_CFG0, 0xFFFFFE67);
+  UsbOr (USB1_UTMIP_TX_CFG0, 0x80000);
+
+  UsbWr (USB1_UTMIP_HSRX_CFG0, (UsbRd (USB1_UTMIP_HSRX_CFG0) & 0xF0F003FF) | 0x88000 | 0x4000);
+  UsbAnd (USB1_UTMIP_BIAS_CFG2, 0xFFFFFFF8);
+
+  UsbWr (USB1_UTMIP_HSRX_CFG1, (UsbRd (USB1_UTMIP_HSRX_CFG1) & 0xFFFFFFC1) | 0x12);
+  UsbOr (USB1_UTMIP_MISC_CFG1, 0x40000000);
+
+  // Enable crystal clock.
+  ClkWr (CLK_RST_UTMIP_PLL_CFG2, ClkRd (CLK_RST_UTMIP_PLL_CFG2) | 0x40000000);
+
+  // Enable USB2 tracking clock.
+  ClkWr (CLK_RST_CLK_ENB_Y_SET, 1U << CLK_Y_USB2_TRK);
+  ClkWr (CLK_RST_CLK_SOURCE_USB2_HSIC_TRK, (ClkRd (CLK_RST_CLK_SOURCE_USB2_HSIC_TRK) & 0xFFFFFF00) | 6);
+
+  UsbWr (USB1_UTMIP_BIAS_CFG1, (UsbRd (USB1_UTMIP_BIAS_CFG1) & 0xFFC03F07) | 0x78000 | 0x50);
+  UsbAnd (USB1_UTMIP_BIAS_CFG0, 0xFFFFFBFF);
+  udelay (1);
+
+  // Force PDTRK input into power up.
+  UsbWr (USB1_UTMIP_BIAS_CFG1, (UsbRd (USB1_UTMIP_BIAS_CFG1) & 0xFFFFFFFE) | 2);
+  udelay (100);
+
+  // TRK cycle done. Force PDTRK input into power down.
+  UsbWr (USB1_UTMIP_BIAS_CFG1, (UsbRd (USB1_UTMIP_BIAS_CFG1) & 0xFF7FFFFF) | 1);
+  udelay (3);
+
+  // Force PDTRK input into power up.
+  UsbAnd (USB1_UTMIP_BIAS_CFG1, 0xFFFFFFFE);
+  udelay (100);
+
+  // TRK cycle done. Force PDTRK input into power down.
+  UsbWr (USB1_UTMIP_BIAS_CFG1, (UsbRd (USB1_UTMIP_BIAS_CFG1) & 0xFF7FFFFF) | 1);
+
+  // Disable USB2 tracking clock and configure UTMIP misc.
+  ClkWr (CLK_RST_CLK_ENB_Y_CLR, 1U << CLK_Y_USB2_TRK);
+  ClkWr (CLK_RST_UTMIP_PLL_CFG2, (ClkRd (CLK_RST_UTMIP_PLL_CFG2) & 0xFEFFFFEA) | 0x2000000 | 0x28 | 2);
+  udelay (1);
+
+  UsbAnd (USB1_UTMIP_BIAS_CFG0, 0xFF3FF7FF);
+  udelay (1);
+
+  // Clear power downs on UTMIP ID and VBUS wake up, PD, PD2, PDZI, PDCHRP, PDDR.
+  MmioAnd32 (PMC_BASE_ADDR + PMC_USB_AO, 0xFFFFFFF3);
+  udelay (1);
+  UsbAnd (USB1_UTMIP_XCVR_CFG0, 0xFFFFBFFF);
+  udelay (1);
+  UsbAnd (USB1_UTMIP_XCVR_CFG0, 0xFFFEFFFF);
+  udelay (1);
+  UsbAnd (USB1_UTMIP_XCVR_CFG0, 0xFFFBFFFF);
+  udelay (1);
+  UsbAnd (USB1_UTMIP_XCVR_CFG1, 0xFFFFFFFB);
+  udelay (1);
+  UsbAnd (USB1_UTMIP_XCVR_CFG1, 0xFFFFFFEF);
+  udelay (1);
+}
+
+//
+// hekate _usbd_reset_usb_otg_phy_device_mode(), but selecting host mode.
+//
+STATIC
+EFI_STATUS
+UsbResetControllerHostMode (VOID)
+{
+  UINT32 Retries;
+
+  // Clear UTMIP reset and wait for the PHY clock.
+  UsbAnd (USB1_SUSP_CTRL, ~SUSP_CTRL_UTMIP_RESET);
+  if (!UsbWaitPhyClock ()) {
+    return EFI_TIMEOUT;
+  }
+
+  // Stop the controller, idle mode, reset.
+  UsbAnd (USB1_USBCMD, ~USBCMD_RUN);
+  UsbAnd (USB1_USBMODE, ~USBMODE_CM_MASK);
+  UsbOr (USB1_USBCMD, USBCMD_RESET);
+
+  for (Retries = USB_POLL_RETRIES; Retries != 0; Retries--) {
+    if ((UsbRd (USB1_USBCMD) & USBCMD_RESET) == 0) {
+      break;
+    }
+
+    udelay (1);
+  }
+
+  if (Retries == 0) {
+    return EFI_TIMEOUT;
+  }
+
+  if (!UsbWaitPhyClock ()) {
+    return EFI_TIMEOUT;
+  }
+
+  // Host mode.
+  UsbWr (USB1_USBMODE, (UsbRd (USB1_USBMODE) & ~USBMODE_CM_MASK) | USBMODE_CM_HOST);
+  for (Retries = USB_POLL_RETRIES; Retries != 0; Retries--) {
+    if ((UsbRd (USB1_USBMODE) & USBMODE_CM_MASK) == USBMODE_CM_HOST) {
+      return EFI_SUCCESS;
+    }
+
+    udelay (1);
+  }
+
+  return EFI_TIMEOUT;
+}
+
+/*
+ * bm92t36 (ROHM USB-C PD controller, I2C1 0x18). Its registers need a combined write+read with a
+ * repeated START, which the legacy-mode I2cLib cannot do, so port hekate's packet-mode transfer.
+ */
+#define I2C1_BASE        0x7000C000
+#define BM92T_ADDR       0x18
+
+STATIC
+VOID
+I2cLoadCfgWait (
+    volatile UINT32 *B
+)
+{
+    UINT32 I;
+
+    B[0x8C / 4] = (1 << 5) | (1 << 2) | 1;
+    for (I = 0; I < 20; I++) {
+        if (!(B[0x8C / 4] & 1)) break;
+        gBS->Stall (1);
+    }
+}
+
+// Write one register byte, repeated START, read RxSize (<= 8) bytes. Returns 0 on success.
+STATIC
+UINT32
+I2c1WriteRead (
+    IN  UINT32 Dev,
+    IN  UINT8  Reg,
+    OUT UINT8  *Rx,
+    IN  UINT32 RxSize
+)
+{
+    volatile UINT32 *B = (volatile UINT32 *)(UINTN)I2C1_BASE;
+    UINT32 Res = 0;
+    UINT32 Left = RxSize;
+    UINT32 T;
+
+    B[0x04 / 4] = (Dev << 1) | 1;
+    B[0x00 / 4] = (2 << 12) | (1 << 11) | (1 << 6);          // debounce, new master FSM, read
+    B[0x5C / 4] = 3;                                          // flush RX/TX FIFO
+    I2cLoadCfgWait (B);
+    B[0x00 / 4] = (B[0x00 / 4] & ~(1 << 9)) | (1 << 10);     // packet mode go
+
+    B[0x50 / 4] = (1 << 4);                                   // protocol I2C
+    B[0x50 / 4] = 0;                                          // 1 byte
+    B[0x50 / 4] = (1 << 16) | (Dev << 1);                     // repeated start
+    B[0x50 / 4] = Reg;
+
+    for (T = 0; T < 200; T++) {
+        if (((B[0x58 / 4] >> 4) & 0xFFF) == 0) break;
+        gBS->Stall (1000);
+    }
+
+    B[0x50 / 4] = (1 << 4);
+    B[0x50 / 4] = RxSize - 1;
+    B[0x50 / 4] = (1 << 19) | (Dev << 1);                     // read
+
+    T = 0;
+    while (Left) {
+        if (B[0x60 / 4] & 0xF) {
+            UINT32 Len = Left < 4 ? Left : 4;
+            UINT32 W = B[0x54 / 4];
+            UINT32 K;
+            for (K = 0; K < Len; K++) {
+                Rx[(RxSize - Left) + K] = (UINT8)(W >> (8 * K));
+            }
+            Left -= Len;
+        } else {
+            gBS->Stall (1000);
+            if (++T > 200) { Res = 1; break; }
+        }
+    }
+
+    if (B[0x1C / 4] & 0xF) Res = 1;                           // NACK
+    gBS->Stall (20);
+    B[0x00 / 4] &= ~((1 << 9) | (1 << 10));
+    return Res;
+}
+
+STATIC
+UINT32
+Bm92tRead16 (
+    IN  UINT8  Reg,
+    OUT UINT32 *Val
+)
+{
+    UINT8 D[2] = { 0xEE, 0xEE };
+    UINT32 R = I2c1WriteRead (BM92T_ADDR, Reg, D, 2);
+
+    *Val = D[0] | (D[1] << 8);
+    return R;
+}
+
+STATIC UINT32 mBmResets;
+
+// Same as the Linux extcon driver: SPDSRC1/2 power path ON (CONFIG1[15:14]=0), OCP enabled (VENDOR bit2=0).
+STATIC
+VOID
+Bm92tReapply (
+    VOID
+)
+{
+    UINT32 V;
+    UINT8  W[2];
+
+    if (!Bm92tRead16 (0x06, &V) && (V & (3 << 14))) {
+        V &= ~(3 << 14);
+        W[0] = V & 0xFF; W[1] = (V >> 8) & 0xFF;
+        i2c_send_buf_small (I2C_1, BM92T_ADDR, 0x06, W, 2);
+    }
+    if (!Bm92tRead16 (0x1A, &V) && (V & (1 << 2))) {
+        V &= ~(1 << 2);
+        W[0] = V & 0xFF; W[1] = (V >> 8) & 0xFF;
+        i2c_send_buf_small (I2C_1, BM92T_ADDR, 0x1A, W, 2);
+    }
+}
+
+// STATUS1[1:0] != 0 is the PD IC's "internal error" state. The Linux driver answers it with a full
+// SYS_RESET (command 0x0D0D) and re-applies its setup. At most 3 times, never with a cable inserted.
+STATIC
+VOID
+Bm92tCheck (
+    VOID
+)
+{
+    UINT32 S1, Dummy;
+    UINT8  Cmd[2] = { 0x0D, 0x0D };
+
+    if (Bm92tRead16 (0x03, &S1)) return;
+    if ((S1 & 3) && !(S1 & 0x80) && mBmResets < 3) {
+        mBmResets++;
+        i2c_send_buf_small (I2C_1, BM92T_ADDR, 0x05, Cmd, 2);
+        gBS->Stall (33000);
+        Bm92tRead16 (0x02, &Dummy);                      // clear the alert after the reset
+        gBS->Stall (100000);
+        Bm92tReapply ();
+    }
+}
+
+STATIC VOID UsbPowerWatch (VOID);
+
+STATIC
+VOID
+EFIAPI
+Bm92tPollTimer (
+    IN EFI_EVENT  Event,
+    IN VOID       *Context
+)
+{
+    Bm92tCheck ();
+    UsbPowerWatch ();
+}
+
+STATIC
+VOID
+Bm92tEnableSource (
+    VOID
+)
+{
+    UINT32 Man, Dev;
+
+    if (Bm92tRead16 (0x4D, &Man) || Bm92tRead16 (0x4E, &Dev) || Man != 0x4B5 || Dev != 0x3B0) {
+        DEBUG((DEBUG_ERROR, "USB: bm92t36 not found (man=%x dev=%x)\n", Man, Dev));
+        return;
+    }
+    Bm92tCheck ();
+    Bm92tReapply ();
+    DEBUG((DEBUG_INFO, "USB: bm92t36 source path enabled\n"));
+}
+
+/*
+ * Switch the Type-C port between "we feed VBUS" (bq24193 OTG boost + GPIO CC4 + bm92t36 source path,
+ * what a USB keyboard needs) and "someone else feeds VBUS" (charger / dock: boost off, charging on,
+ * GPIO CC4 low so we never drive 5 V into the other side's VBUS).
+ */
+STATIC BOOLEAN mSourceOn;
+
+STATIC
+VOID
+UsbVbusSource (
+    IN BOOLEAN On
+)
+{
+    UINT8 Reg;
+
+    // Pad: not the USB function, so the GPIO output drives it (as hekate does).
+    MmioWrite32 (0x70003000 + 0x1A8, (1 << 8) | 1);
+
+    if (!On) {
+        gpio_config (GPIO_PORT_CC, GPIO_PIN_4, GPIO_MODE_GPIO);
+        gpio_write (GPIO_PORT_CC, GPIO_PIN_4, GPIO_LOW);
+        gpio_output_enable (GPIO_PORT_CC, GPIO_PIN_4, GPIO_OUTPUT_ENABLE);
+    }
+
+    // bq24193 (I2C1 0x6B): only touch it if the vendor/part ID matches.
+    if (i2c_recv_byte (I2C_1, 0x6B, 0x0A) == 0x2F) {
+        if (On) {
+            // REG05: disable the I2C watchdog, or it resets OTG back to charge.
+            Reg = i2c_recv_byte (I2C_1, 0x6B, 0x05);
+            Reg &= ~(3 << 4);
+            i2c_send_byte (I2C_1, 0x6B, 0x05, Reg);
+        }
+        // REG01 CHG_CONFIG[5:4]: 10b = OTG boost on, 01b = charge battery.
+        Reg = i2c_recv_byte (I2C_1, 0x6B, 0x01);
+        Reg = (Reg & ~(3 << 4)) | ((On ? 2 : 1) << 4);
+        i2c_send_byte (I2C_1, 0x6B, 0x01, Reg);
+        DEBUG((DEBUG_INFO, "USB: bq24193 %a, REG01=%02x\n", On ? "OTG on" : "charge", i2c_recv_byte (I2C_1, 0x6B, 0x01)));
+    } else {
+        DEBUG((DEBUG_ERROR, "USB: bq24193 not found, no OTG/charge switch\n"));
+    }
+
+    if (On) {
+        Bm92tEnableSource ();
+        // nvidia,vbus-gpio = <&gpio TEGRA_GPIO(CC, 4) GPIO_ACTIVE_HIGH>
+        gpio_config (GPIO_PORT_CC, GPIO_PIN_4, GPIO_MODE_GPIO);
+        gpio_write (GPIO_PORT_CC, GPIO_PIN_4, GPIO_HIGH);
+        gpio_output_enable (GPIO_PORT_CC, GPIO_PIN_4, GPIO_OUTPUT_ENABLE);
+    }
+    mSourceOn = On;
+}
+
+#if SWITCH_USB_POWERWATCH
+/*
+ * Charger / dock hot-plug recovery.
+ *
+ * Everything above runs once at boot. When a charger is plugged or removed afterwards, the PD controller
+ * renegotiates the power role and VBUS changes hands: the keyboard loses its supply and, once the source
+ * comes back, nothing re-enables it and the UsbBus driver never sees the device again.
+ *
+ * Every 250 ms (from the bm92t36 poll timer): sample bq24193 REG08 (VBUS_STAT / PG_STAT) and bm92t36 STATUS1.
+ * When the sample has changed and stayed the same for two polls (~0.5 s), and at most every ~2 s:
+ *   1. VBUS: someone else feeds VBUS (VBUS_STAT = USB host / adapter)  -> boost off, charge on, CC4 low.
+ *            nobody does                                                -> boost on, CC4 high, PD source path.
+ *   2. If anything flipped the USB2 pad mux to XUSB (xusbinit), put it back to EHCI ("back to USB 2.0").
+ *   3. Cycle the root port power so UsbBus drops the device and enumerates it again.
+ * The controller itself (host mode, PHY, running EHCI state) is not touched.
+ */
+#define WATCH_NONE      0xFFFFFFFFu
+#define WATCH_COOLDOWN  8               // polls (250 ms each) between recoveries
+#define CAR_BASE_ADDR   0x60006000UL
+#define CAR_RST_W_REG   0x35C
+#define CAR_ENB_W_REG   0x364
+#define XUSB_RST_W_BIT  BIT15
+#define XUSB_PADCTL_BIT BIT14
+#define XUSB_PADCTL_USB2_PAD_MUX  0x7009F004UL
+
+STATIC UINT32 mWatchStable = WATCH_NONE;    // last signature we acted on / started with
+STATIC UINT32 mWatchSeen   = WATCH_NONE;    // candidate new signature
+STATIC UINT32 mWatchSeenN;
+STATIC UINT32 mWatchCool;
+STATIC UINT32 mWatchRuns;
+
+STATIC
+UINT32
+UsbPowerSample (
+    OUT BOOLEAN *ExternalSource
+)
+{
+    UINT32 S1 = 0;
+    UINT8  B08 = 0xFF;
+    UINT32 Vs;
+
+    *ExternalSource = FALSE;
+    if (i2c_recv_byte (I2C_1, 0x6B, 0x0A) == 0x2F) {
+        B08 = i2c_recv_byte (I2C_1, 0x6B, 0x08);
+    }
+    Bm92tRead16 (0x03, &S1);
+
+    Vs = (B08 >> 6) & 3;                    // 0 none, 1 USB host, 2 adapter, 3 OTG (we are the source)
+    if (B08 != 0xFF && (Vs == 1 || Vs == 2)) {
+        *ExternalSource = TRUE;
+    }
+    return ((UINT32)(B08 & 0xC4)) | ((S1 & 0x1083) << 8);   // VBUS_STAT, PG_STAT | PD insert/src/err bits
+}
+
+STATIC
+VOID
+UsbPortPowerCycle (
+    VOID
+)
+{
+    EFI_TPL Tpl;
+    UINT32  V;
+
+    Tpl = gBS->RaiseTPL (TPL_NOTIFY);       // keep EhciDxe's own PORTSC accesses out of the read-modify-write
+    V = UsbRd (USB1_PORTSC);
+    UsbWr (USB1_PORTSC, V & ~(PORTSC_PP | PORTSC_W1C_MASK));
+    gBS->RestoreTPL (Tpl);
+
+    gBS->Stall (150 * 1000);
+
+    Tpl = gBS->RaiseTPL (TPL_NOTIFY);
+    V = UsbRd (USB1_PORTSC);
+    UsbWr (USB1_PORTSC, (V | PORTSC_PP) & ~PORTSC_W1C_MASK);
+    gBS->RestoreTPL (Tpl);
+}
+
+STATIC
+BOOLEAN
+UsbPadBackToEhci (
+    VOID
+)
+{
+    UINT32 V;
+
+    // Never touch 0x7009xxxx unless the XUSB block is clocked and out of reset (else the CPU stalls).
+    if ((MmioRead32 (CAR_BASE_ADDR + CAR_ENB_W_REG) & XUSB_RST_W_BIT) == 0 ||
+        (MmioRead32 (CAR_BASE_ADDR + CAR_RST_W_REG) & (XUSB_RST_W_BIT | XUSB_PADCTL_BIT)) != 0) {
+        return FALSE;
+    }
+    V = MmioRead32 (XUSB_PADCTL_USB2_PAD_MUX);
+    if ((V & ((3 << 0) | (3 << 18))) == 0) {
+        return FALSE;
+    }
+    MmioWrite32 (XUSB_PADCTL_USB2_PAD_MUX, V & ~((3U << 0) | (3U << 18)));
+    return TRUE;
+}
+
+STATIC
+VOID
+UsbPowerWatch (
+    VOID
+)
+{
+    BOOLEAN Ext;
+    UINT32  Sig;
+
+    if (mWatchCool != 0) mWatchCool--;
+
+    Sig = UsbPowerSample (&Ext);
+    if (mWatchStable == WATCH_NONE) {       // first sample after boot: baseline, nothing to recover
+        mWatchStable = Sig;
+        mWatchSeen   = Sig;
+        return;
+    }
+    if (Sig == mWatchStable) {
+        mWatchSeen  = Sig;
+        mWatchSeenN = 0;
+        return;
+    }
+    if (Sig != mWatchSeen) {                // a new candidate: wait for it to hold
+        mWatchSeen  = Sig;
+        mWatchSeenN = 1;
+        return;
+    }
+    if (++mWatchSeenN < 2 || mWatchCool != 0) {
+        return;
+    }
+
+    // Stable change: re-set the port up.
+    mWatchStable = Sig;
+    mWatchSeenN  = 0;
+    mWatchCool   = WATCH_COOLDOWN;
+    mWatchRuns++;
+    DEBUG((DEBUG_INFO, "USB: power change #%d sig=%08x external=%d -> re-setup\n", mWatchRuns, Sig, Ext));
+
+    if (Ext) {
+        if (mSourceOn) UsbVbusSource (FALSE);
+    } else {
+        UsbVbusSource (TRUE);
+    }
+    if (UsbPadBackToEhci ()) {
+        DEBUG((DEBUG_INFO, "USB: USB2 pad mux restored to EHCI\n"));
+    }
+    UsbPortPowerCycle ();
+}
+#else
+STATIC VOID UsbPowerWatch (VOID) { }
+#endif
 
 /* Set up VBUS for host/device mode */
 static void set_up_vbus(
@@ -369,85 +817,11 @@ static void set_up_vbus(
 		return;
 	}
 
-	if (config->vbus_gpio_valid) 
+	if (config->vbus_gpio_valid)
     {
-		int vbus_value;
-		vbus_value = (init == USB_INIT_HOST);
-
-        // nvidia,vbus-gpio = <&gpio TEGRA_GPIO(CC, 4) GPIO_ACTIVE_HIGH>
-        gpio_config(GPIO_PORT_CC, GPIO_PIN_4, GPIO_MODE_GPIO);
-	    gpio_write(GPIO_PORT_CC, GPIO_PIN_4, GPIO_HIGH);
-	    gpio_output_enable(GPIO_PORT_CC, GPIO_PIN_4, GPIO_OUTPUT_ENABLE);
-		debug("set_up_vbus: done \n");
+        UsbVbusSource (TRUE);
+        DEBUG((DEBUG_INFO, "USB: VBUS enabled\n"));
 	}
-}
-
-int usb_common_init(struct fdt_usb *config, enum usb_init_type init)
-{
-	int ret = 0;
-
-	switch (init) {
-	case USB_INIT_HOST:
-		switch (config->dr_mode) {
-		case DR_MODE_HOST:
-		case DR_MODE_OTG:
-			break;
-		default:
-			printf("tegrausb: Invalid dr_mode %d for host mode\n", config->dr_mode);
-			return -1;
-		}
-		break;
-	case USB_INIT_DEVICE:
-		if (config->periph_id != PERIPH_ID_USBD) {
-			printf("tegrausb: Device mode only supported on first USB controller\n");
-			return -1;
-		}
-		if (!config->utmi) {
-			printf("tegrausb: Device mode only supported with UTMI PHY\n");
-			return -1;
-		}
-		switch (config->dr_mode) {
-		case DR_MODE_DEVICE:
-		case DR_MODE_OTG:
-			break;
-		default:
-			printf("tegrausb: Invalid dr_mode %d for device mode\n", config->dr_mode);
-			return -1;
-		}
-		break;
-	default:
-		printf("tegrausb: Unknown USB_INIT_* %d\n", init);
-		return -1;
-	}
-
-	debug("%d, %d\n", config->utmi, config->ulpi);
-	if (config->utmi)
-	{
-        ret = init_utmi_usb_controller(config, init);
-    }
-	else if (config->ulpi)
-	{
-        printf("tegrausb: only UTMI is currently supported \n");
-        return -1;
-    }
-
-	if (ret) return ret;
-
-	set_up_vbus(config, init);
-	config->init_type = init;
-
-	return 0;
-}
-
-static void config_clock(const u32 timing[])
-{
-	debug("%s: DIVM = %d, DIVN = %d, DIVP = %d, cpcon/lfcon = %d/%d\n",
-	      __func__, timing[PARAM_DIVM], timing[PARAM_DIVN],
-	      timing[PARAM_DIVP], timing[PARAM_CPCON], timing[PARAM_LFCON]);
-
-	mClkProtocol->StartPll(CLOCK_ID_USB,
-		timing[PARAM_DIVM], timing[PARAM_DIVN], timing[PARAM_DIVP],
-		timing[PARAM_CPCON], timing[PARAM_LFCON]);
 }
 
 EFI_STATUS
@@ -456,8 +830,6 @@ ConfigController(
 )
 {
     EFI_STATUS Status;
-    UINT8      Data = 0;
-    int ret;
 
     mPriv.reg = (VOID*) (UINTN) 0x7d000000;
     mPriv.enabled = 1;
@@ -471,15 +843,16 @@ ConfigController(
     mPriv.vbus_gpio_valid = true;
     mPriv.clk_done = false;
 
-    ret = usb_common_init(&mPriv, USB_INIT_HOST);
-    if (ret) return EFI_DEVICE_ERROR;
+    UsbInitPhy();
 
-    if (!mPriv.clk_done)
+    Status = UsbResetControllerHostMode();
+    if (EFI_ERROR(Status))
     {
-        config_clock(get_pll_timing(&fdt_usb_controllers[mPriv.type]));
-        mPriv.clk_done = true;
+        DEBUG((DEBUG_ERROR, "USB: controller bring-up failed: %r\n", Status));
+        return EFI_DEVICE_ERROR;
     }
 
+    set_up_vbus(&mPriv, USB_INIT_HOST);
     return EFI_SUCCESS;
 }
 
@@ -490,6 +863,43 @@ ConfigureUSBHost(
 )
 {
     return EFI_SUCCESS;
+}
+
+#define USB1_PHY_VBUS_WAKEUP_ID         0x408
+#define VBUSS_B_SESS_VLD_WAKEUP_EN      BIT14
+#define VBUSS_A_SESS_VLD_WAKEUP_EN      BIT22
+#define VBUSS_A_VBUS_VLD_WAKEUP_EN      BIT30
+#define WAKEID_ID_INT_EN                BIT0
+#define WAKEID_ID_CHG_DET               BIT1
+#define WAKEID_VBUS_WAKEUP_INT_EN       BIT8
+#define WAKEID_VBUS_WAKEUP_CHG_DET      BIT9
+#define WAKEID_VBUS_WAKEUP_WAKEUP_EN    BIT30
+
+/*
+ * ExitBootServices: leave the USB1 wrapper quiet for the OS.
+ * The ACPI tables describe no USB device, so Windows has no ISR for the controller's IRQ. If a VBUS / ID /
+ * session-valid change (charger, keyboard, PD role swap) raises it after the hand-over, nothing services it.
+ * EhcExitBootService resets the EHCI core; this also disables the wrapper-level wake/interrupt enables and
+ * acknowledges any pending change-detect bits (write 1 to clear).
+ */
+STATIC
+VOID
+EFIAPI
+UsbQuiesceOnExitBootServices (
+    IN EFI_EVENT Event,
+    IN VOID      *Context
+)
+{
+    UINT32 Val;
+
+    Val = UsbRd (USB1_PHY_VBUS_SENSORS);
+    Val &= ~(VBUSS_B_SESS_VLD_WAKEUP_EN | VBUSS_A_SESS_VLD_WAKEUP_EN | VBUSS_A_VBUS_VLD_WAKEUP_EN);
+    UsbWr (USB1_PHY_VBUS_SENSORS, Val);
+
+    Val = UsbRd (USB1_PHY_VBUS_WAKEUP_ID);
+    Val &= ~(WAKEID_ID_INT_EN | WAKEID_VBUS_WAKEUP_INT_EN | WAKEID_VBUS_WAKEUP_WAKEUP_EN);
+    Val |= (WAKEID_ID_CHG_DET | WAKEID_VBUS_WAKEUP_CHG_DET);
+    UsbWr (USB1_PHY_VBUS_WAKEUP_ID, Val);
 }
 
 EFI_STATUS
@@ -511,6 +921,20 @@ PciEmulationEntryPoint(
 
     Status = ConfigController();
     if (EFI_ERROR(Status)) goto exit;
+
+    {
+        EFI_EVENT QuiesceEvent;
+        gBS->CreateEvent (EVT_SIGNAL_EXIT_BOOT_SERVICES, TPL_CALLBACK, UsbQuiesceOnExitBootServices, NULL, &QuiesceEvent);
+    }
+
+    {
+        EFI_EVENT BmEvent;
+        if (!EFI_ERROR (gBS->CreateEvent (EVT_TIMER | EVT_NOTIFY_SIGNAL, TPL_CALLBACK,
+                                          Bm92tPollTimer, NULL, &BmEvent))) {
+            gBS->SetTimer (BmEvent, TimerPeriodic, 2500 * 1000);   // every 250 ms
+        }
+    }
+
     return RegisterNonDiscoverableMmioDevice(
         NonDiscoverableDeviceTypeEhci,
         NonDiscoverableDeviceDmaTypeNonCoherent,
