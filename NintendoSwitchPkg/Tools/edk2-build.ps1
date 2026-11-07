@@ -89,9 +89,15 @@ if ($commit) {
 	Set-Content -Path NintendoSwitchPkg/Include/FwReleaseInfo.h -Value $releaseInfoContent -ErrorAction SilentlyContinue -Force
 }
 
+# SWITCH_USB=1 in the environment builds the USB host stack too.
+$buildArgs = @()
+if ($env:SWITCH_USB -eq "1") {
+	$buildArgs += @("-D", "SWITCH_USB=1")
+}
+
 foreach ($target in $availableTargets) {
 	Write-Output "Build NintendoSwitchPkg for $($target) (DEBUG)."
-	build -a AARCH64 -p NintendoSwitchPkg/$($target).dsc -t GCC5
+	build -a AARCH64 -p NintendoSwitchPkg/$($target).dsc -t GCC5 @buildArgs
 
 	if (-not $?) {
 		Write-Error "Build target $($target) failed."
