@@ -1,7 +1,7 @@
 # EDK2 Implementation for Nintendo Switch (Tegra210)
 
 ## Status
-Capable to boot something from SD card. If you have a Linux kernel with EFI stub support, supply the device tree for any Tegra210 device (not limited to Nintendo Switch) should boot.
+Capable to boot something from SD card. If you have a Linux kernel with EFI stub support, supply the device tree for any Tegra210 device should boot.
 
 ACPI also boots Windows and Linux, but limited devices are provided (only CPU at this moment).
 
