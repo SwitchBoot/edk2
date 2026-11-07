@@ -29,11 +29,17 @@ Plug in connector on the right-side Joy Con and connect to PC. Use WinDbg serial
         bcdedit /store E:\EFI\Microsoft\Boot\BCD /set {default} truncatememory 0x100000000
 
 - Only the microSD slot (SDM1) is exposed in ACPI. The eMMC holds the console keys and calibration data, so keep it hidden from Windows.
-- If it still stops with 0x7B, check the first bugcheck parameter with the debugger below.
+- If it still stops with 0x7B, check the first bugcheck parameter with the debugger above.
+
+## USB Host (UEFI only)
+- Off by default. Build with `SWITCH_USB=1 ./run-build.sh` to add EHCI, the USB bus, keyboard and mass storage drivers.
+- Ported from [steck0714/winx](https://github.com/steck0714/winx), where a USB keyboard is reported to work in the UEFI shell. Not verified on hardware here yet.
+- Use a USB-C OTG adapter or hub. The port may stop working after a power or connection change, replug the device then.
+- Windows does not see the controller yet and the firmware stops handling USB at ExitBootServices.
 
 ## Planned / In-Progress
 
-- EHCI USB host
+- USB in Windows
 - eMMC
 - Sideband buttons as input device
 - Joy-Con (maybe not. Need high speed serial)
