@@ -152,6 +152,7 @@ DefinitionBlock("DsdtTable.aml", "DSDT", 1, "NVIDIA", "TEGRA210", EFI_ACPI_ARM_O
             Name (_HID, "NVDA0211")
             Name (_CID, "PNP0D20")      // EHCI USB controller
             Name (_UID, Zero)
+            Name (_CCA, Zero)           // DMA is not coherent
             Name (_HRV, 2)              // Integrated TT, speed in HOSTPC1
 
             Method (_CRS, 0, NotSerialized)
