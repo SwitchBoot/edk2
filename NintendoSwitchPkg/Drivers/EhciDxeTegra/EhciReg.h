@@ -284,6 +284,17 @@ EhcIsSysError (
   );
 
 /**
+  Put the Tegra210 controller back into host mode after a reset.
+
+  @param  Ehc          The EHCI device.
+
+**/
+EFI_STATUS
+EhcTegraSetHostMode (
+  IN USB2_HC_DEV  *Ehc
+  );
+
+/**
   Reset the host controller.
 
   @param  Ehc          The EHCI device.

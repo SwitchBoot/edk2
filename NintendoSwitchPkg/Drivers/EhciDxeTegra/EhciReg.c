@@ -464,6 +464,56 @@ EhcIsSysError (
 }
 
 /**
+  Put the Tegra210 controller back into host mode after a reset. USBCMD.RST
+  drops USBMODE.CM to idle and the controller then never leaves the halted
+  state. Offsets are relative to the operational base.
+
+  @param  Ehc          The EHCI device.
+
+  @retval EFI_SUCCESS  Host mode is selected.
+  @retval EFI_TIMEOUT  PHY clock did not become valid or the mode did not stick.
+
+**/
+EFI_STATUS
+EhcTegraSetHostMode (
+  IN USB2_HC_DEV  *Ehc
+  )
+{
+  UINT32  Retries;
+  UINT32  Mode;
+
+  //
+  // The PHY clock has to be valid again after the controller reset.
+  //
+  for (Retries = 100000; Retries != 0; Retries--) {
+    if ((EhcReadOpReg (Ehc, 0x2D0) & BIT7) != 0) {
+      break;
+    }
+
+    gBS->Stall (1);
+  }
+
+  if (Retries == 0) {
+    DEBUG ((DEBUG_ERROR, "EhcTegraSetHostMode: PHY clock not valid after reset\n"));
+    return EFI_TIMEOUT;
+  }
+
+  Mode = EhcReadOpReg (Ehc, 0xC8);
+  EhcWriteOpReg (Ehc, 0xC8, (Mode & ~0x3U) | 0x3);
+
+  for (Retries = 100000; Retries != 0; Retries--) {
+    if ((EhcReadOpReg (Ehc, 0xC8) & 0x3) == 0x3) {
+      return EFI_SUCCESS;
+    }
+
+    gBS->Stall (1);
+  }
+
+  DEBUG ((DEBUG_ERROR, "EhcTegraSetHostMode: USBMODE did not switch to host\n"));
+  return EFI_TIMEOUT;
+}
+
+/**
   Reset the host controller.
 
   @param  Ehc          The EHCI device.
@@ -494,6 +544,10 @@ EhcResetHC (
 
   EhcSetOpRegBit (Ehc, EHC_USBCMD_OFFSET, USBCMD_RESET);
   Status = EhcWaitOpRegBit (Ehc, EHC_USBCMD_OFFSET, USBCMD_RESET, FALSE, Timeout);
+  if (!EFI_ERROR (Status)) {
+    Status = EhcTegraSetHostMode (Ehc);
+  }
+
   return Status;
 }
 
