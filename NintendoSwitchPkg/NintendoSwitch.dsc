@@ -145,6 +145,7 @@
   # Support Libraries
   DmaBounceBufferLib|NintendoSwitchPkg/Library/DmaBounceBufferLib/DmaBounceBufferLib.inf
    NonDiscoverableDeviceRegistrationLib|MdeModulePkg/Library/NonDiscoverableDeviceRegistrationLib/NonDiscoverableDeviceRegistrationLib.inf
+  UefiUsbLib|MdePkg/Library/UefiUsbLib/UefiUsbLib.inf
 
 [LibraryClasses.common.SEC]
   PcdLib|MdePkg/Library/BasePcdLibNull/BasePcdLibNull.inf
